@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 #![warn(missing_docs)]
 
 //! txwatch-rules evaluates `AlertRule` conditions against enriched Stellar transactions
@@ -13,7 +14,7 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use txwatch_config::{AlertRule, FunctionMatchMode, RuleConfig, EVENT_TOPIC_WILDCARD};
+use txwatch_config::{AlertRule, FunctionMatchMode, RuleConfig, Severity, EVENT_TOPIC_WILDCARD};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -64,6 +65,18 @@ pub struct HorizonTransaction {
     /// `source_account` for regular transactions; for fee-bump
     /// transactions it is the fee-bump (outer) source account.
     pub fee_account: Option<String>,
+    // ── Issue #398: muxed account fields ──────────────────────────────────────
+    /// Muxed (`M…`) form of the transaction's source account, when the
+    /// source is a muxed account. Horizon always reports the underlying
+    /// `G…` account in `source_account`.
+    #[serde(default)]
+    pub source_account_muxed: Option<String>,
+    /// The muxed account id embedded in `source_account_muxed`.
+    #[serde(default)]
+    pub source_account_muxed_id: Option<String>,
+    /// Muxed (`M…`) form of the fee payer, when it is a muxed account.
+    #[serde(default)]
+    pub fee_account_muxed: Option<String>,
     /// Base64-encoded XDR transaction envelope.
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
@@ -102,7 +115,12 @@ pub struct ContractEvent {
 /// comparison and `value` is the expected value as a string.
 pub use txwatch_config::DataMatcher;
 
-pub trait DataMatcherExt {
+/// Internal helper trait adding a `matches` method to [`DataMatcher`].
+///
+/// This exists only to attach the method to the re-exported config type, so
+/// it is deliberately private to this crate.
+trait DataMatcherExt {
+    /// Does `data` satisfy this matcher?
     fn matches(&self, data: &Value) -> bool;
 }
 
@@ -264,6 +282,19 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
     }
 }
 
+// ── Batched webhook body (issue #482) ─────────────────────────────────────────
+
+/// The body of a batched webhook delivery, sent when a receiver enables
+/// `batch_alerts`: `{"alerts": [AlertPayload, …]}`.
+///
+/// The JSON Schema for this type is published as `docs/alert-batch.schema.json`
+/// and can be printed with `txwatch schema --batch`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AlertBatch {
+    /// The alerts delivered together in this webhook call, in evaluation order.
+    pub alerts: Vec<AlertPayload>,
+}
+
 // ── ScVal decoding (issue #266) ───────────────────────────────────────────────
 
 /// Decode a Soroban `ScVal` (in its JSON form) into a plain string for
@@ -273,7 +304,11 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
 pub fn decode_scval(value: &Value) -> String {
     match value {
         Value::Object(map) if map.len() == 1 => {
-            let (key, inner) = map.iter().next().expect("map has one entry");
+            // `map.len() == 1` guarantees an entry, but avoid `expect` so this
+            // can never panic on untrusted chain data.
+            let Some((key, inner)) = map.iter().next() else {
+                return value.to_string();
+            };
             match (key.as_str(), inner) {
                 ("address", Value::String(s))
                 | ("symbol", Value::String(s))
@@ -591,8 +626,8 @@ pub struct AlertPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_account: Option<String>,
     /// Optional severity level from the rule definition.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub severity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<Severity>,
     /// Unix timestamp (seconds).
     pub timestamp: i64,
     /// ISO 8601 timestamp string.
@@ -874,7 +909,7 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
                         .clone()
                         .filter(|f| tx.source_account.as_deref() != Some(f.as_str())),
                     // Per-rule delivery overrides, absent unless the rule sets them.
-                    severity: entry.severity().map(|s| s.to_string()),
+                    severity: entry.severity().cloned(),
                     effective_webhook_url: entry.webhook_url().map(str::to_owned),
                     effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
                     timestamp,
@@ -922,8 +957,14 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
                         amount_xlm_decimal: amount_xlm_decimal.clone(),
                         fee_charged_stroops: tx.fee_charged_stroops,
                         source_account: tx.source_account.clone(),
+                        // Only surface the fee payer when it differs from the
+                        // source account (fee-bump transactions, issue #251).
+                        fee_account: tx
+                            .fee_account
+                            .clone()
+                            .filter(|f| tx.source_account.as_deref() != Some(f.as_str())),
                         // Per-rule delivery overrides, absent unless the rule sets them.
-                        severity: entry.severity().map(|s| s.to_string()),
+                        severity: entry.severity().cloned(),
                         effective_webhook_url: entry.webhook_url().map(str::to_owned),
                         effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
                         timestamp,
@@ -1095,6 +1136,7 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
         AlertRule::SourceAccount {
             mode,
+            field,
             accounts,
             alert_unless,
             allow,
@@ -1251,8 +1293,16 @@ fn rule_label(rule: &AlertRule) -> String {
     match rule {
         AlertRule::AnyTransaction => "AnyTransaction".into(),
         AlertRule::TransactionFailed => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { threshold_xlm, .. } => {
-            format!("LargeTransfer(>={}XLM)", threshold_xlm)
+        AlertRule::LargeTransfer {
+            threshold_xlm,
+            direction,
+            ..
+        } => {
+            if direction == "any" {
+                format!("LargeTransfer(>={}XLM)", threshold_xlm)
+            } else {
+                format!("LargeTransfer({}>={}XLM)", direction, threshold_xlm)
+            }
         }
         // #266: argument matchers are part of the label (see AlertRule::label).
         AlertRule::FunctionCalled { args, .. } if !args.is_empty() => rule.label(),
@@ -1280,6 +1330,7 @@ fn rule_label(rule: &AlertRule) -> String {
         }
         AlertRule::SourceAccount {
             mode,
+            field,
             accounts,
             alert_unless,
             allow,
@@ -1303,7 +1354,12 @@ fn rule_label(rule: &AlertRule) -> String {
                     txwatch_config::SourceAccountMode::In => "in",
                     txwatch_config::SourceAccountMode::NotIn => "not_in",
                 };
-                format!("SourceAccount({}: [{}])", mode_str, list.join(", "))
+                format!(
+                    "SourceAccount({}{}: [{}])",
+                    field_str,
+                    mode_str,
+                    list.join(", ")
+                )
             } else {
                 let mut parts = Vec::new();
                 if !allow.is_empty() {
@@ -1312,7 +1368,7 @@ fn rule_label(rule: &AlertRule) -> String {
                 if !deny.is_empty() {
                     parts.push(format!("deny=[{}]", deny.join(", ")));
                 }
-                format!("SourceAccount({})", parts.join(", "))
+                format!("SourceAccount({}{})", field_str, parts.join(", "))
             }
         }
         AlertRule::All { rules } => {
@@ -1333,6 +1389,62 @@ fn rule_label(rule: &AlertRule) -> String {
     }
 }
 
+// ── Synthetic payloads ────────────────────────────────────────────────────────
+
+/// Builds an alert payload that is not tied to a transaction (NoActivity
+/// incidents and recoveries, cooldown summaries). Every transaction-derived
+/// field is empty; callers set `suppressed_count` etc. on the result.
+#[allow(clippy::too_many_arguments)]
+fn synthetic_payload(
+    ctx: &EvalContext<'_>,
+    rule_type: &str,
+    rule_triggered: String,
+    alert_id: String,
+    now: DateTime<Utc>,
+    horizon_link: String,
+    explorer_link: String,
+    resolved: bool,
+) -> AlertPayload {
+    AlertPayload {
+        schema_version: 1,
+        alert_id,
+        label: ctx.label.to_string(),
+        contract_id: ctx.contract_id.to_string(),
+        network: ctx.network.to_string(),
+        rule_type: rule_type.to_string(),
+        rule_triggered,
+        transaction_hash: String::new(),
+        function_name: None,
+        function_names: vec![],
+        function_args: vec![],
+        amount_xlm: None,
+        amount_stroops: None,
+        amount_xlm_decimal: None,
+        fee_charged_stroops: None,
+        source_account: None,
+        fee_account: None,
+        severity: None,
+        timestamp: now.timestamp(),
+        timestamp_iso: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        horizon_link,
+        explorer_link,
+        effective_webhook_url: None,
+        effective_webhook_secret: None,
+        ledger: None,
+        memo: None,
+        memo_type: None,
+        operation_count: None,
+        resolved,
+        matched_events: vec![],
+        suppressed_count: 0,
+        observed_count: None,
+        test: false,
+        old_wasm_hash: None,
+        new_wasm_hash: None,
+        enrichment_incomplete: false,
+    }
+}
+
 // ── NoActivity poll-cycle evaluation ─────────────────────────────────────────
 
 /// State machine for a single `NoActivity` rule instance on one contract.
@@ -1348,6 +1460,8 @@ pub enum NoActivityState {
     /// The threshold was exceeded and an alert was fired.  We're in the quiet
     /// window; we will fire a recovery alert the next time a transaction arrives.
     Alerting {
+        /// `alert_id` of the incident alert that opened this quiet window;
+        /// reused as the `alert_id` of the recovery alert.
         #[serde(default)]
         incident_alert_id: String,
     },
@@ -1396,11 +1510,9 @@ pub fn check_no_activity(
     let is_quiet = quiet_since >= threshold;
 
     let ts = now.timestamp();
-    let ts_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    // Synthetic payloads have no transaction — use empty hash and link to Horizon
-    // account page rather than a specific transaction.
-    let synthetic_hash = String::new();
+    // Synthetic payloads have no transaction — link to the Horizon account
+    // page rather than a specific transaction.
     let synthetic_horizon_link = format!("{}/accounts/{}", horizon_base, ctx.contract_id);
     let synthetic_explorer_link = match explorer_base {
         Some(base) => format!("{}/contract/{}", base, ctx.contract_id),
@@ -1422,45 +1534,16 @@ pub fn check_no_activity(
             *state = NoActivityState::Alerting {
                 incident_alert_id: incident_id.clone(),
             };
-            Some(AlertPayload {
-                label: ctx.label.to_string(),
-                contract_id: ctx.contract_id.to_string(),
-                network: ctx.network.to_string(),
-                rule_type: "NoActivity".into(),
+            Some(synthetic_payload(
+                ctx,
+                "NoActivity",
                 rule_triggered,
-                alert_id: incident_id,
-                schema_version: 1,
-                amount_stroops: None,
-                amount_xlm_decimal: None,
-                source_account: None,
-                fee_account: None,
-                severity: None,
-                effective_webhook_url: None,
-                effective_webhook_secret: None,
-                ledger: None,
-                memo: None,
-                memo_type: None,
-                operation_count: None,
-                matched_events: vec![],
-                suppressed_count: 0,
-                observed_count: None,
-                test: false,
-                old_wasm_hash: None,
-                new_wasm_hash: None,
-                enrichment_incomplete: false,
-
-                transaction_hash: synthetic_hash,
-                function_name: None,
-                function_names: vec![],
-                function_args: vec![],
-                amount_xlm: None,
-                fee_charged_stroops: None,
-                timestamp: ts,
-                timestamp_iso: ts_iso,
-                horizon_link: synthetic_horizon_link,
-                explorer_link: synthetic_explorer_link,
-                resolved: false,
-            })
+                incident_id,
+                now,
+                synthetic_horizon_link,
+                synthetic_explorer_link,
+                false,
+            ))
         }
         // Already alerting and activity has resumed → fire recovery.
         (NoActivityState::Alerting { incident_alert_id }, false) => {
@@ -1486,45 +1569,16 @@ pub fn check_no_activity(
                 _ => last_horizon_link.clone(),
             };
             let rule_triggered = format!("NoActivity({}min) resolved", minutes);
-            Some(AlertPayload {
-                label: ctx.label.to_string(),
-                contract_id: ctx.contract_id.to_string(),
-                network: ctx.network.to_string(),
-                rule_type: "NoActivity".into(),
+            Some(synthetic_payload(
+                ctx,
+                "NoActivity",
                 rule_triggered,
-                alert_id: recovery_alert_id,
-                schema_version: 1,
-                amount_stroops: None,
-                amount_xlm_decimal: None,
-                source_account: None,
-                fee_account: None,
-                severity: None,
-                effective_webhook_url: None,
-                effective_webhook_secret: None,
-                ledger: None,
-                memo: None,
-                memo_type: None,
-                operation_count: None,
-                matched_events: vec![],
-                suppressed_count: 0,
-                observed_count: None,
-                test: false,
-                old_wasm_hash: None,
-                new_wasm_hash: None,
-                enrichment_incomplete: false,
-
-                transaction_hash: synthetic_hash,
-                function_name: None,
-                function_names: vec![],
-                function_args: vec![],
-                amount_xlm: None,
-                fee_charged_stroops: None,
-                timestamp: ts,
-                timestamp_iso: ts_iso,
-                horizon_link: last_horizon_link,
-                explorer_link: last_explorer_link,
-                resolved: true,
-            })
+                recovery_alert_id,
+                now,
+                last_horizon_link,
+                last_explorer_link,
+                true,
+            ))
         }
         _ => None,
     }
@@ -1568,6 +1622,7 @@ impl From<CooldownTracker> for Vec<((String, String), CooldownState)> {
 }
 
 impl CooldownTracker {
+    /// An empty tracker with no recorded cooldown state.
     pub fn new() -> Self {
         Self::default()
     }
@@ -1653,6 +1708,14 @@ impl CooldownTracker {
         }
     }
 
+    /// Drop every entry whose `(contract, rule)` key is not present in
+    /// `keys` (issue #401). Called after a config reload so renamed rules,
+    /// removed contracts and stale labels do not accumulate in the persisted
+    /// state document.
+    pub fn prune(&mut self, keys: &std::collections::HashSet<(String, String)>) {
+        self.state.retain(|k, _| keys.contains(k));
+    }
+
     /// Check for any rules where the cooldown window has expired and
     /// `suppressed > 0` with `cooldown_summary = true`.
     /// Emits a summary alert payload for each such rule and resets `suppressed` to 0.
@@ -1697,7 +1760,6 @@ impl CooldownTracker {
                     state.last_fired = now;
 
                     let ts = now.timestamp();
-                    let ts_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
                     let alert_id = alert_id(
                         &ctx.network_id,
                         ctx.contract_id,
@@ -1707,42 +1769,18 @@ impl CooldownTracker {
                         rule_index,
                     );
 
-                    summaries.push(AlertPayload {
-                        label: ctx.label.to_string(),
-                        contract_id: ctx.contract_id.to_string(),
-                        network: ctx.network.to_string(),
-                        rule_type: rule_cfg.rule.rule_type().to_string(),
-                        rule_triggered: rule_trig,
+                    let mut summary = synthetic_payload(
+                        ctx,
+                        rule_cfg.rule.rule_type(),
+                        rule_trig,
                         alert_id,
-                        schema_version: 1,
-                        amount_stroops: None,
-                        amount_xlm_decimal: None,
-                        source_account: None,
-                        fee_account: None,
-                        severity: None,
-                        effective_webhook_url: None,
-                        effective_webhook_secret: None,
-                        ledger: None,
-                        memo: None,
-                        memo_type: None,
-                        operation_count: None,
-                        matched_events: vec![],
-                        suppressed_count,
-                        test: false,
-                        old_wasm_hash: None,
-                        new_wasm_hash: None,
-                        enrichment_incomplete: false,
-                        transaction_hash: String::new(),
-                        function_name: None,
-                        function_names: vec![],
-                        amount_xlm: None,
-                        fee_charged_stroops: None,
-                        timestamp: ts,
-                        timestamp_iso: ts_iso,
-                        horizon_link: synthetic_horizon_link.clone(),
-                        explorer_link: synthetic_explorer_link.clone(),
-                        resolved: false,
-                    });
+                        now,
+                        synthetic_horizon_link.clone(),
+                        synthetic_explorer_link.clone(),
+                        false,
+                    );
+                    summary.suppressed_count = suppressed_count;
+                    summaries.push(summary);
                 }
             }
         }
@@ -1782,7 +1820,7 @@ impl RateTracker {
         now: DateTime<Utc>,
     ) -> Vec<AlertPayload> {
         let mut out = Vec::new();
-        for entry in rules.iter().filter(|e| e.enabled()) {
+        for (rule_index, entry) in rules.iter().enumerate().filter(|(_, e)| e.enabled()) {
             let rule: &AlertRule = entry.as_ref();
             let AlertRule::Rate {
                 rule: inner,
@@ -1825,6 +1863,11 @@ impl RateTracker {
             {
                 hits.pop_front();
             }
+            // #401: never keep more than `count` timestamps per rule.
+            let cap = usize::try_from(*count).unwrap_or(usize::MAX).max(1);
+            while hits.len() > cap {
+                hits.pop_front();
+            }
             let observed = hits.len() as u64;
             if observed < *count {
                 continue;
@@ -1836,16 +1879,29 @@ impl RateTracker {
             let mut payloads = evaluate(ctx, std::slice::from_ref(&inner.rule), tx, None);
             if let Some(mut payload) = payloads.pop() {
                 payload.rule_type = rule.rule_type().to_string();
-                payload.alert_id = alert_id(ctx.contract_id, &tx.hash, &label);
+                payload.alert_id = alert_id(
+                    &ctx.network_id,
+                    ctx.contract_id,
+                    &tx.hash,
+                    rule.rule_type(),
+                    &label,
+                    rule_index,
+                );
                 payload.rule_triggered = label;
                 payload.observed_count = Some(observed);
-                payload.severity = entry.severity().map(|s| s.to_string());
+                payload.severity = entry.severity().cloned();
                 payload.effective_webhook_url = entry.webhook_url().map(str::to_owned);
                 payload.effective_webhook_secret = entry.webhook_secret().map(str::to_owned);
                 out.push(payload);
             }
         }
         out
+    }
+
+    /// Drop every entry whose `(contract, rule)` key is not present in
+    /// `keys` (issue #401).
+    pub fn prune(&mut self, keys: &std::collections::HashSet<(String, String)>) {
+        self.hits.retain(|k, _| keys.contains(k));
     }
 }
 
@@ -2739,7 +2795,7 @@ mod tests {
             payloads[0].effective_webhook_secret.as_deref(),
             Some("mysecret")
         );
-        assert_eq!(payloads[0].severity.as_deref(), Some("critical"));
+        assert_eq!(payloads[0].severity, Some(Severity::Critical));
     }
 
     #[test]
@@ -3260,6 +3316,111 @@ mod tests {
         );
     }
 
+    // ── Issue #398: muxed source accounts ─────────────────────────────────────
+
+    #[test]
+    fn source_account_muxed_entry_matches_muxed_source() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.source_account_muxed =
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
+                accounts: vec![
+                    "MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into(),
+                ],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "M… entries must match source_account_muxed"
+        );
+    }
+
+    #[test]
+    fn source_account_muxed_entry_does_not_match_base_account() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.source_account_muxed =
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
+                accounts: vec![
+                    "MBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+                ],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "a different M… entry must not match"
+        );
+    }
+
+    #[test]
+    fn source_account_g_entry_does_not_match_muxed_source() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.source_account_muxed =
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
+                accounts: vec![
+                    "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+                ],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "G… entries must not match the muxed source"
+        );
+    }
+
+    #[test]
+    fn source_account_muxed_fee_account_entry_matches() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into());
+        tx.fee_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.fee_account_muxed =
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::FeeAccount,
+                accounts: vec![
+                    "MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into(),
+                ],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "M… entries must match fee_account_muxed for field=fee_account"
+        );
+    }
+
     #[test]
     fn source_account_field_fee_account_label_mentions_field() {
         use txwatch_config::{SourceAccountField, SourceAccountMode};
@@ -3276,6 +3437,161 @@ mod tests {
             "label must distinguish fee_account rules, got: {}",
             label
         );
+    }
+
+    // ── Issue #371: fee_account only when it differs ─────────────────────────
+
+    #[test]
+    fn non_fee_bump_transaction_serialises_without_fee_account() {
+        let mut tx = make_tx(true, &[], None);
+        // Horizon reports fee_account == source_account for regular transactions.
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.fee_account = tx.source_account.clone();
+        let payloads = run(&[entry(AlertRule::AnyTransaction)], &tx);
+        assert_eq!(payloads.len(), 1);
+        let json = serde_json::to_value(&payloads[0]).unwrap();
+        assert!(json.get("fee_account").is_none(), "got: {json}");
+        assert_eq!(
+            json.get("source_account").and_then(|v| v.as_str()),
+            Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN")
+        );
+    }
+
+    // ── Issue #372: SourceAccount `field` on regular and fee-bump txs ────────
+
+    #[test]
+    fn source_account_field_matrix_regular_and_fee_bump() {
+        use txwatch_config::{SourceAccountField, SourceAccountMode};
+        const INNER: &str = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        const PAYER: &str = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+        let rule = |field, account: &str| {
+            entry(AlertRule::SourceAccount {
+                mode: SourceAccountMode::In,
+                field,
+                accounts: vec![account.into()],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })
+        };
+
+        // Regular transaction: source and fee payer are the same account.
+        let mut regular = make_tx(true, &[], None);
+        regular.source_account = Some(PAYER.into());
+        regular.fee_account = Some(PAYER.into());
+        // Fee-bump transaction: the fee payer differs from the inner source.
+        let mut fee_bump = make_tx(true, &[], None);
+        fee_bump.source_account = Some(INNER.into());
+        fee_bump.fee_account = Some(PAYER.into());
+
+        let cases = [
+            (&regular, SourceAccountField::Source, PAYER, true),
+            (&regular, SourceAccountField::FeeAccount, PAYER, true),
+            (&regular, SourceAccountField::Source, INNER, false),
+            (&regular, SourceAccountField::FeeAccount, INNER, false),
+            (&fee_bump, SourceAccountField::Source, INNER, true),
+            (&fee_bump, SourceAccountField::Source, PAYER, false),
+            (&fee_bump, SourceAccountField::FeeAccount, PAYER, true),
+            (&fee_bump, SourceAccountField::FeeAccount, INNER, false),
+        ];
+        for (tx, field, account, fires) in cases {
+            let payloads = run(&[rule(field, account)], tx);
+            assert_eq!(
+                payloads.len(),
+                usize::from(fires),
+                "field={:?} account={} source={:?} fee={:?}",
+                field,
+                account,
+                tx.source_account,
+                tx.fee_account
+            );
+        }
+    }
+
+    #[test]
+    fn source_account_rule_label_matches_config_label() {
+        use txwatch_config::{SourceAccountField, SourceAccountMode};
+        for field in [SourceAccountField::Source, SourceAccountField::FeeAccount] {
+            for (accounts, allow) in [
+                (vec!["GA".to_string()], vec![]),
+                (vec![], vec!["GA".to_string()]),
+            ] {
+                let rule = AlertRule::SourceAccount {
+                    mode: SourceAccountMode::NotIn,
+                    field,
+                    accounts,
+                    alert_unless: vec![],
+                    allow,
+                    deny: vec![],
+                };
+                assert_eq!(rule_label(&rule), rule.label());
+            }
+        }
+    }
+
+    // ── Issue #373: Rate alert IDs use the six-argument alert_id ─────────────
+
+    #[test]
+    fn rate_alert_id_includes_network_and_rule_index() {
+        let ctx = EvalContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            network: "testnet",
+            network_id: "testnet".into(),
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: None,
+        };
+        let rate = AlertRule::Rate {
+            rule: Box::new(entry(AlertRule::AnyTransaction)),
+            count: 1,
+            window_seconds: 60,
+        };
+        let rules = [entry(AlertRule::TransactionFailed), entry(rate.clone())];
+        let tx = make_tx(true, &[], None);
+        let now: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+
+        let payloads = RateTracker::new().evaluate(&ctx, &rules, &tx, now);
+        assert_eq!(payloads.len(), 1);
+        let p = &payloads[0];
+        assert_eq!(p.rule_type, "Rate");
+        assert_eq!(p.observed_count, Some(1));
+        assert_eq!(
+            p.alert_id,
+            alert_id("testnet", ctx.contract_id, &tx.hash, "Rate", &rate.label(), 1)
+        );
+        assert_ne!(
+            p.alert_id,
+            alert_id("testnet", ctx.contract_id, &tx.hash, "Rate", &rate.label(), 0)
+        );
+    }
+
+    #[test]
+    fn synthetic_payload_has_no_transaction_fields() {
+        let ctx = EvalContext {
+            label: "Label",
+            contract_id: "CA",
+            network: "testnet",
+            network_id: "testnet".into(),
+            horizon_base: "https://h",
+            explorer_base: None,
+        };
+        let now: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+        let p = synthetic_payload(
+            &ctx,
+            "NoActivity",
+            "NoActivity(5min)".into(),
+            "id".into(),
+            now,
+            "h".into(),
+            "e".into(),
+            true,
+        );
+        assert!(p.function_args.is_empty());
+        assert_eq!(p.observed_count, None);
+        assert_eq!(p.transaction_hash, "");
+        assert_eq!(p.timestamp, now.timestamp());
+        assert_eq!(p.timestamp_iso, "2024-01-15T12:00:00Z");
+        assert!(p.resolved);
     }
 
     #[test]
@@ -3330,6 +3646,45 @@ mod tests {
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert!(!enriched.enrichment_incomplete);
     }
+
+    #[test]
+    fn from_horizon_deserialises_muxed_account_fields() {
+        let raw: HorizonTransaction = serde_json::from_value(serde_json::json!({
+            "hash": "h1",
+            "created_at": "2024-06-01T00:00:00Z",
+            "successful": true,
+            "paging_token": "1",
+            "source_account": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+            "source_account_muxed": "MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ",
+            "source_account_muxed_id": "1234",
+            "fee_account_muxed": "MBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        }))
+        .unwrap();
+        assert_eq!(
+            raw.source_account_muxed.as_deref(),
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ")
+        );
+        assert_eq!(raw.source_account_muxed_id.as_deref(), Some("1234"));
+        assert_eq!(
+            raw.fee_account_muxed.as_deref(),
+            Some("MBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+        );
+    }
+
+    #[test]
+    fn from_horizon_muxed_fields_default_to_none() {
+        let raw: HorizonTransaction = serde_json::from_value(serde_json::json!({
+            "hash": "h1",
+            "created_at": "2024-06-01T00:00:00Z",
+            "successful": true,
+            "paging_token": "1",
+            "source_account": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+        }))
+        .unwrap();
+        assert!(raw.source_account_muxed.is_none());
+        assert!(raw.source_account_muxed_id.is_none());
+        assert!(raw.fee_account_muxed.is_none());
+    }
 }
 
 // ── Property-based tests (#61) ────────────────────────────────────────────────
@@ -3358,6 +3713,9 @@ mod prop_tests {
             fee_charged_stroops: fee_stroops,
             source_account: None,
             fee_account: None,
+            source_account_muxed: None,
+            source_account_muxed_id: None,
+            fee_account_muxed: None,
             ledger: None,
             memo: None,
             memo_type: None,
@@ -4126,6 +4484,51 @@ mod suppressor_tests {
     }
 
     #[test]
+    fn large_transfer_payload_amount_follows_direction() {
+        // #400: amount_stroops must reflect the direction that fired, not the
+        // sum of every in and out transfer.
+        let mut tx = make_tx(true, &[], None);
+        tx.watched_contract_id = "CWATCHED".into();
+        tx.contract_transfers = vec![
+            ContractTransfer {
+                from: "GUSER".into(),
+                to: "CWATCHED".into(),
+                amount_stroops: 10_000_000_000,
+            },
+            ContractTransfer {
+                from: "CWATCHED".into(),
+                to: "GOTHER".into(),
+                amount_stroops: 9_000_000_000,
+            },
+        ];
+        let rule = |direction: &str| {
+            entry(AlertRule::LargeTransfer {
+                threshold_xlm: 1000,
+                threshold_stroops: 10_000_000_000,
+                direction: direction.into(),
+            })
+        };
+
+        let inbound = run(&[rule("in")], &tx);
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].amount_stroops, Some(10_000_000_000));
+        assert_eq!(inbound[0].amount_in_stroops, Some(10_000_000_000));
+        assert_eq!(inbound[0].amount_out_stroops, Some(9_000_000_000));
+
+        let outbound = run(&[rule("out")], &tx);
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].amount_stroops, Some(9_000_000_000));
+        assert_eq!(outbound[0].amount_in_stroops, Some(10_000_000_000));
+        assert_eq!(outbound[0].amount_out_stroops, Some(9_000_000_000));
+
+        let any = run(&[rule("any")], &tx);
+        assert_eq!(any.len(), 1);
+        assert_eq!(any[0].amount_stroops, Some(19_000_000_000));
+        assert_eq!(any[0].amount_in_stroops, Some(10_000_000_000));
+        assert_eq!(any[0].amount_out_stroops, Some(9_000_000_000));
+    }
+
+    #[test]
     fn large_transfer_filters_by_contract_and_direction() {
         let mut tx = make_tx(true, &[], None);
         tx.watched_contract_id = "CWATCHED".into();
@@ -4451,6 +4854,21 @@ mod suppressor_tests {
     }
 
     #[test]
+    fn cooldown_prune_drops_removed_rules() {
+        // #401: reloading with fewer rules must shrink the persisted state.
+        let mut tracker = CooldownTracker::new();
+        let now = TestClock::start().now();
+        assert_eq!(tracker.check("CA", "AnyTransaction", 60, now), Some(0));
+        assert_eq!(tracker.check("CA", "TransactionFailed", 60, now), Some(0));
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(("CA".to_owned(), "AnyTransaction".to_owned()));
+        tracker.prune(&keys);
+        let persisted: Vec<((String, String), CooldownState)> = tracker.into();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].0 .1, "AnyTransaction");
+    }
+
+    #[test]
     fn cooldown_is_tracked_per_contract() {
         let mut tracker = CooldownTracker::new();
         let now = TestClock::start().now();
@@ -4543,5 +4961,191 @@ mod suppressor_tests {
         assert!(tracker
             .check_summaries(&rules, &eval_ctx, clock.now())
             .is_empty());
+    }
+}
+
+// ── Property-based tests for stateful trackers (#490) ─────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tracker_prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use txwatch_config::AlertRule;
+
+    /// A single match attempt: how many ledger seconds elapse before it and
+    /// whether it actually matches the rule.
+    #[derive(Debug, Clone, Copy)]
+    struct MatchAttempt {
+        /// Ledger-time seconds elapsed since the previous attempt.
+        delta_secs: u64,
+        /// Whether this attempt produced a match.
+        matched: bool,
+    }
+
+    fn arb_attempts() -> impl Strategy<Value = Vec<MatchAttempt>> {
+        proptest::collection::vec(
+            (0u64..=120u64, proptest::bool::ANY).prop_map(|(delta_secs, matched)| {
+                MatchAttempt {
+                    delta_secs,
+                    matched,
+                }
+            }),
+            0..40,
+        )
+    }
+
+    /// Drive a `CooldownTracker` through `attempts`, returning the ledger
+    /// timestamps of every alert that was let through and the total number of
+    /// suppressed matches reported across those alerts.
+    fn drive_cooldown(
+        tracker: &mut CooldownTracker,
+        cooldown_secs: u64,
+        attempts: &[MatchAttempt],
+        start: DateTime<Utc>,
+    ) -> (Vec<DateTime<Utc>>, u64) {
+        let mut now = start;
+        let mut fired_at = Vec::new();
+        let mut reported_suppressed = 0u64;
+        for attempt in attempts {
+            now += chrono::TimeDelta::seconds(attempt.delta_secs as i64);
+            if !attempt.matched {
+                continue;
+            }
+            if let Some(suppressed) = tracker.check("CA", "AnyTransaction", cooldown_secs, now) {
+                reported_suppressed += suppressed;
+                fired_at.push(now);
+            }
+        }
+        (fired_at, reported_suppressed)
+    }
+
+    proptest! {
+        /// A cooldown never lets two alerts through within `cooldown_seconds`
+        /// of ledger time, and every alert after the first reports the exact
+        /// number of matches dropped since the previous alert.
+        #[test]
+        fn cooldown_never_fires_twice_within_window(
+            cooldown_secs in 1u64..=600u64,
+            attempts in arb_attempts(),
+        ) {
+            let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+            let mut tracker = CooldownTracker::new();
+            let (fired_at, reported_suppressed) =
+                drive_cooldown(&mut tracker, cooldown_secs, &attempts, start);
+
+            // Invariant 1: consecutive alerts are at least `cooldown_secs` apart.
+            for pair in fired_at.windows(2) {
+                let gap = (pair[1] - pair[0]).num_seconds();
+                prop_assert!(
+                    gap >= cooldown_secs as i64,
+                    "two alerts let through {}s apart with cooldown {}s",
+                    gap,
+                    cooldown_secs
+                );
+            }
+
+            // Invariant 2: suppressed_count totals equal the dropped matches.
+            let total_matches = attempts.iter().filter(|a| a.matched).count() as u64;
+            let dropped = total_matches - fired_at.len() as u64;
+            prop_assert_eq!(
+                reported_suppressed,
+                dropped,
+                "suppressed_count total must equal dropped matches"
+            );
+        }
+
+        /// With a disabled (zero) cooldown every match is let through and
+        /// nothing is ever reported as suppressed.
+        #[test]
+        fn zero_cooldown_lets_every_match_through(attempts in arb_attempts()) {
+            let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+            let mut tracker = CooldownTracker::new();
+            let (fired_at, reported_suppressed) = drive_cooldown(&mut tracker, 0, &attempts, start);
+            let total_matches = attempts.iter().filter(|a| a.matched).count();
+            prop_assert_eq!(fired_at.len(), total_matches);
+            prop_assert_eq!(reported_suppressed, 0);
+        }
+
+        /// `RateTracker` fires at most `floor(matches / count)` times, and
+        /// exactly that many times once the window has fully elapsed.
+        #[test]
+        fn rate_tracker_fires_at_most_floor_matches_over_count(
+            count in 1u32..=20u32,
+            window_secs in 1u64..=3600u64,
+            matches in 0u32..=200u32,
+        ) {
+            let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+            let mut tracker = RateTracker::new();
+            let mut fired = 0u32;
+            // All matches land at the same ledger instant, so the window
+            // never rolls over during the burst.
+            for _ in 0..matches {
+                if tracker.check("CA", "AnyTransaction", count, window_secs, start) {
+                    fired += 1;
+                }
+            }
+            let expected = matches / count;
+            prop_assert_eq!(
+                fired,
+                expected,
+                "RateTracker fired {} times for {} matches with count {}",
+                fired,
+                matches,
+                count
+            );
+            prop_assert!(fired <= matches / count);
+        }
+
+        /// `RateTracker` never fires more than `count` times inside a single
+        /// window, regardless of how the matches are spread over ledger time.
+        #[test]
+        fn rate_tracker_respects_window(
+            count in 1u32..=10u32,
+            window_secs in 1u64..=600u64,
+            attempts in arb_attempts(),
+        ) {
+            let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+            let mut tracker = RateTracker::new();
+            let mut now = start;
+            let mut fired_at = Vec::new();
+            for attempt in &attempts {
+                now += chrono::TimeDelta::seconds(attempt.delta_secs as i64);
+                if attempt.matched
+                    && tracker.check("CA", "AnyTransaction", count, window_secs, now)
+                {
+                    fired_at.push(now);
+                }
+            }
+            // Any `count + 1` consecutive fires must span more than one window.
+            for window in fired_at.windows(count as usize + 1) {
+                let span = (window[count as usize] - window[0]).num_seconds();
+                prop_assert!(
+                    span >= window_secs as i64,
+                    "{} fires within {}s with count {} and window {}s",
+                    count + 1,
+                    span,
+                    count,
+                    window_secs
+                );
+            }
+        }
+    }
+
+    /// Sanity check that the strategies above actually exercise the trackers.
+    #[test]
+    fn cooldown_tracker_helpers_are_exercised() {
+        let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+        let attempts = vec![
+            MatchAttempt { delta_secs: 0, matched: true },
+            MatchAttempt { delta_secs: 10, matched: true },
+            MatchAttempt { delta_secs: 60, matched: true },
+        ];
+        let mut tracker = CooldownTracker::new();
+        let (fired_at, suppressed) = drive_cooldown(&mut tracker, 60, &attempts, start);
+        assert_eq!(fired_at.len(), 2);
+        assert_eq!(suppressed, 1);
+        // Keep the unused import warning-free.
+        let _ = AlertRule::AnyTransaction;
     }
 }
