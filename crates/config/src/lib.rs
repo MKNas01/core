@@ -2575,6 +2575,11 @@ pub struct AppConfig {
     #[serde(skip)]
     #[schemars(skip)]
     pub loaded_files: Vec<PathBuf>,
+    /// Every `include` pattern that was expanded (root and nested), with the
+    /// files it matched. Used to report match counts and empty globs (#410).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub include_matches: Vec<IncludeMatch>,
     /// Map of lowercase contract label to the file where it was defined.
     #[serde(skip)]
     #[schemars(skip)]
@@ -2597,6 +2602,7 @@ impl Default for AppConfig {
             state_file: None,
             include: Vec::new(),
             loaded_files: Vec::new(),
+            include_matches: Vec::new(),
             contract_files: std::collections::HashMap::new(),
             readiness_policy: ReadinessPolicy::default(),
         }
@@ -2820,6 +2826,74 @@ fn resolve_destination(
     Ok(())
 }
 
+/// One `include` pattern after `${VAR}` interpolation and expansion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncludeMatch {
+    /// The pattern as written, after `${VAR}` interpolation.
+    pub pattern: String,
+    /// Whether the pattern contains glob metacharacters (`*`, `?`, `[`).
+    pub is_glob: bool,
+    /// Matched files, sorted. For a non-glob pattern this is the file itself,
+    /// or empty when it does not exist.
+    pub files: Vec<PathBuf>,
+}
+
+/// `pattern` joined to `base_dir` (or as-is when absolute).
+fn include_path(base_dir: &Path, pattern: &str) -> PathBuf {
+    if Path::new(pattern).is_absolute() {
+        PathBuf::from(pattern)
+    } else {
+        base_dir.join(pattern)
+    }
+}
+
+/// Expands `include` patterns relative to `base_dir` (#409). Shared by
+/// config loading and [`compute_config_hash`] so both resolve the same files:
+/// `${VAR}` references are interpolated, and only the pattern itself (not the
+/// base directory) is treated as a glob, so a directory such as
+/// `/etc/txwatch[prod]` is matched literally.
+fn expand_includes(base_dir: &Path, patterns: &[String]) -> Result<Vec<IncludeMatch>> {
+    patterns
+        .iter()
+        .map(|raw| {
+            let pattern = resolve_env_interpolation(raw).context("include")?;
+            let is_glob = pattern.contains(['*', '?', '[']);
+            let mut files = Vec::new();
+            if is_glob {
+                let full = if Path::new(&pattern).is_absolute() {
+                    pattern.clone()
+                } else {
+                    let base = glob::Pattern::escape(&base_dir.to_string_lossy());
+                    if base.is_empty() {
+                        pattern.clone()
+                    } else {
+                        Path::new(&base).join(&pattern).to_string_lossy().into_owned()
+                    }
+                };
+                let paths = glob::glob(&full)
+                    .map_err(|e| anyhow!("invalid include glob pattern '{}': {}", pattern, e))?;
+                for entry in paths {
+                    let p = entry.map_err(|e| anyhow!("error reading glob path: {}", e))?;
+                    if p.is_file() {
+                        files.push(p);
+                    }
+                }
+                files.sort();
+            } else {
+                let full = include_path(base_dir, &pattern);
+                if full.is_file() {
+                    files.push(full);
+                }
+            }
+            Ok(IncludeMatch {
+                pattern,
+                is_glob,
+                files,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct IncludedFile {
@@ -2992,41 +3066,20 @@ impl AppConfig {
             return Ok(());
         }
 
-        for pattern in &mut self.include {
-            resolve_field(pattern, "include")?;
-        }
-
+        let matches = expand_includes(base_dir, &self.include)?;
         let mut matched_files: Vec<PathBuf> = Vec::new();
-
-        for pattern in &self.include {
-            let full_pattern = if Path::new(pattern).is_absolute() {
-                PathBuf::from(pattern)
-            } else {
-                base_dir.join(pattern)
-            };
-            let pattern_str = full_pattern.to_string_lossy();
-            let is_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
-
-            if is_glob {
-                let paths = glob::glob(&pattern_str)
-                    .map_err(|e| anyhow!("invalid include glob pattern '{}': {}", pattern, e))?;
-                for entry in paths {
-                    let p = entry.map_err(|e| anyhow!("error reading glob path: {}", e))?;
-                    if p.is_file() {
-                        matched_files.push(p);
-                    }
-                }
-            } else {
-                if !full_pattern.is_file() {
-                    bail!(
-                        "cannot read config file '{}' (included in '{}')",
-                        full_pattern.display(),
-                        base_dir.display()
-                    );
-                }
-                matched_files.push(full_pattern);
+        for (pattern, m) in self.include.iter_mut().zip(&matches) {
+            if !m.is_glob && m.files.is_empty() {
+                bail!(
+                    "cannot read config file '{}' (included in '{}')",
+                    include_path(base_dir, &m.pattern).display(),
+                    base_dir.display()
+                );
             }
+            *pattern = m.pattern.clone();
+            matched_files.extend(m.files.iter().cloned());
         }
+        self.include_matches.extend(matches);
 
         // Deterministic ordering: sort lexicographically
         matched_files.sort();
@@ -3086,6 +3139,7 @@ impl AppConfig {
                 stack.pop();
                 result?;
                 self.loaded_files.extend(sub_cfg.loaded_files);
+                self.include_matches.extend(sub_cfg.include_matches);
                 self.contract_files.extend(sub_cfg.contract_files);
                 self.contracts.extend(sub_cfg.contracts);
             }
@@ -3094,6 +3148,14 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+
+    /// Include globs that matched no files (#410). Such a pattern loads
+    /// successfully but contributes nothing, which usually means a typo.
+    pub fn empty_include_globs(&self) -> impl Iterator<Item = &IncludeMatch> {
+        self.include_matches
+            .iter()
+            .filter(|m| m.is_glob && m.files.is_empty())
     }
 
     /// The contract limit in force: `max_contracts`, else [`MAX_CONTRACTS`].
@@ -3273,42 +3335,67 @@ fn hash_config_recursive(
     hasher.update(canonical.to_string_lossy().as_bytes());
     hasher.update(&content);
 
+    // Only the fields that name other files are read; everything else in the
+    // file is ignored here (and covered by hashing the raw content above).
     #[derive(Deserialize, Default)]
-    struct ConfigIncludesOnly {
+    struct HashedDestination {
+        #[serde(default)]
+        template_file: Option<String>,
+        #[serde(default)]
+        client_cert: Option<String>,
+        #[serde(default)]
+        client_key: Option<String>,
+        #[serde(default)]
+        ca_cert: Option<String>,
+    }
+    #[derive(Deserialize, Default)]
+    struct HashedContract {
+        #[serde(default)]
+        webhooks: Vec<HashedDestination>,
+    }
+    #[derive(Deserialize, Default)]
+    struct HashedConfig {
         #[serde(default)]
         include: Vec<String>,
+        #[serde(default)]
+        contracts: Vec<HashedContract>,
     }
 
     if let Ok(cfg) =
-        toml::from_str::<ConfigIncludesOnly>(std::str::from_utf8(&content).unwrap_or_default())
+        toml::from_str::<HashedConfig>(std::str::from_utf8(&content).unwrap_or_default())
     {
-        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut matched_files: Vec<PathBuf> = Vec::new();
-        for pattern in cfg.include {
-            let full_pattern = if Path::new(&pattern).is_absolute() {
-                PathBuf::from(pattern)
-            } else {
-                base_dir.join(pattern)
-            };
-            let pattern_str = full_pattern.to_string_lossy();
-            let is_glob =
-                pattern_str.contains('*') || pattern_str.contains('?') || pattern_str.contains('[');
-            if is_glob {
-                if let Ok(paths) = glob::glob(&pattern_str) {
-                    for entry in paths.flatten() {
-                        if entry.is_file() {
-                            matched_files.push(entry);
-                        }
-                    }
+        // #408: template and mTLS files are read at load time, so a change to
+        // them must change the hash too. Paths resolve exactly as at load time.
+        for destination in cfg.contracts.iter().flat_map(|c| &c.webhooks) {
+            for file in [
+                &destination.template_file,
+                &destination.client_cert,
+                &destination.client_key,
+                &destination.ca_cert,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let Ok(file) = resolve_env_interpolation(file) else {
+                    continue;
+                };
+                hasher.update(file.as_bytes());
+                if let Ok(bytes) = fs::read(&file) {
+                    hasher.update(&bytes);
                 }
-            } else if full_pattern.is_file() {
-                matched_files.push(full_pattern);
             }
         }
-        matched_files.sort();
-        matched_files.dedup();
-        for file in matched_files {
-            let _ = hash_config_recursive(&file, hasher, visited);
+
+        // #409: resolve includes exactly as `resolve_includes` does.
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        if let Ok(matches) = expand_includes(base_dir, &cfg.include) {
+            let mut matched_files: Vec<PathBuf> =
+                matches.into_iter().flat_map(|m| m.files).collect();
+            matched_files.sort();
+            matched_files.dedup();
+            for file in matched_files {
+                let _ = hash_config_recursive(&file, hasher, visited);
+            }
         }
     }
 
@@ -5917,6 +6004,113 @@ mod tests {
         );
     }
 
+    // ── Config hash and include expansion (#408, #409, #410) ─────────────────
+
+    /// A fresh, empty directory under the system temp dir for one test.
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("txwatch_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn modifying_template_file_changes_config_hash() {
+        let dir = fresh_dir("hash_template");
+        let template = dir.join("body.j2");
+        fs::write(&template, "{{ label }}").unwrap();
+        let root = dir.join("txwatch.toml");
+        fs::write(
+            &root,
+            format!(
+                r#"
+                [[contracts]]
+                label = "x"
+                contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+                network = "testnet"
+                [[contracts.webhooks]]
+                url = "https://example.com/hook"
+                format = "template"
+                template_file = {:?}
+                [[contracts.rules]]
+                type = "AnyTransaction"
+                "#,
+                template.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let before = compute_config_hash(&root).unwrap();
+        assert_eq!(before, compute_config_hash(&root).unwrap());
+        fs::write(&template, "{{ label }} changed").unwrap();
+        assert_ne!(
+            before,
+            compute_config_hash(&root).unwrap(),
+            "editing template_file must change the config hash"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_hash_follows_env_var_includes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = fresh_dir("hash_env_include");
+        let conf_d = dir.join("conf.d");
+        fs::create_dir_all(&conf_d).unwrap();
+        let included = conf_d.join("a.toml");
+        fs::write(&included, "contracts = []\n").unwrap();
+        let root = dir.join("txwatch.toml");
+        fs::write(&root, "include = [\"${TXWATCH_TEST_CONF_DIR}/*.toml\"]\n").unwrap();
+        env::set_var("TXWATCH_TEST_CONF_DIR", conf_d.to_string_lossy().as_ref());
+
+        let before = compute_config_hash(&root).unwrap();
+        fs::write(&included, "contracts = []\n# edited\n").unwrap();
+        let after = compute_config_hash(&root).unwrap();
+        env::remove_var("TXWATCH_TEST_CONF_DIR");
+        assert_ne!(before, after, "an included file behind ${{VAR}} must be hashed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_hash_follows_includes_under_bracketed_directory() {
+        let dir = fresh_dir("hash_bracket").join("txwatch[prod]");
+        fs::create_dir_all(dir.join("conf.d")).unwrap();
+        let included = dir.join("conf.d").join("a.toml");
+        fs::write(&included, "contracts = []\n").unwrap();
+        let root = dir.join("txwatch.toml");
+        fs::write(&root, "include = [\"conf.d/*.toml\"]\n").unwrap();
+
+        let matches = expand_includes(&dir, &["conf.d/*.toml".to_string()]).unwrap();
+        assert_eq!(matches[0].files, vec![included.clone()]);
+
+        let before = compute_config_hash(&root).unwrap();
+        fs::write(&included, "contracts = []\n# edited\n").unwrap();
+        assert_ne!(
+            before,
+            compute_config_hash(&root).unwrap(),
+            "a '[' in the base directory must not be treated as a glob"
+        );
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn include_glob_matching_no_files_is_reported() {
+        let dir = fresh_dir("empty_glob");
+        let root = dir.join("txwatch.toml");
+        fs::write(
+            &root,
+            format!("include = [\"contracts.d/*.toml\"]\n{}", MINIMAL_TOML),
+        )
+        .unwrap();
+
+        let cfg = AppConfig::from_file(&root).unwrap();
+        assert_eq!(cfg.include_matches.len(), 1);
+        assert_eq!(cfg.include_matches[0].pattern, "contracts.d/*.toml");
+        assert!(cfg.include_matches[0].is_glob);
+        assert!(cfg.include_matches[0].files.is_empty());
+        let empty: Vec<_> = cfg.empty_include_globs().collect();
+        assert_eq!(empty.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
     // ── Rule type aliases and labels (#367, #368) ───────────────────────────
 
     /// `(PascalCase, snake_case, extra TOML body)` for every `AlertRule` variant.

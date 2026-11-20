@@ -477,6 +477,22 @@ async fn main() -> Result<()> {
             println!("Config is valid.");
             println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
             println!("  contracts             : {}", cfg.contracts.len());
+            // #410: report how many files each include pattern matched.
+            if !cfg.include_matches.is_empty() {
+                println!("  includes              :");
+                for m in &cfg.include_matches {
+                    println!(
+                        "    {} -> {} file(s){}",
+                        m.pattern,
+                        m.files.len(),
+                        if m.is_glob && m.files.is_empty() {
+                            " (warning: glob matches no files)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             println!();
             for c in &cfg.contracts {
                 println!(
@@ -1580,6 +1596,7 @@ fn start_notify_watcher(
 fn reload_config(path: &Path, horizon_url: Option<&str>) -> Option<AppConfig> {
     match AppConfig::from_file(path) {
         Ok(mut cfg) => {
+            warn_empty_include_globs(&cfg);
             if let Some(url) = horizon_url {
                 let url = url.trim_end_matches('/');
                 for c in &mut cfg.contracts {
@@ -1640,9 +1657,18 @@ fn prune_cursors(path: &str, cfg: &AppConfig, dry_run: bool) -> Result<Vec<Strin
     Ok(stale)
 }
 
+/// #410: an include glob that matches nothing loads fine but monitors nothing
+/// from that location, so surface it.
+fn warn_empty_include_globs(cfg: &AppConfig) {
+    for m in cfg.empty_include_globs() {
+        warn!(pattern = %m.pattern, "include glob matches no files");
+    }
+}
+
 /// Load the config and apply `--horizon-url`, if given, to every contract.
 fn load_config(cli: &Cli) -> Result<AppConfig> {
     let mut cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
+    warn_empty_include_globs(&cfg);
     if let Some(url) = &cli.horizon_url {
         let url = url.trim_end_matches('/');
         for c in &mut cfg.contracts {
@@ -1764,6 +1790,17 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
             })
         })
         .collect();
+    // #410: each include pattern with the number of files it matched.
+    let includes: Vec<_> = cfg
+        .include_matches
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "pattern": m.pattern,
+                "glob": m.is_glob,
+                "matched_files": m.files.len(),
+            })
+        })
     // #481: include every effective top-level setting and the loaded files.
     let loaded_files: Vec<String> = cfg
         .loaded_files()
@@ -1774,6 +1811,7 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
         "valid": true,
         "poll_interval_seconds": cfg.poll_interval_seconds,
         "cursor_file": cfg.cursor_file,
+        "includes": includes,
         "state_file": cfg.state_file,
         "include": cfg.include,
         "loaded_files": loaded_files,

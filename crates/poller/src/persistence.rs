@@ -118,16 +118,50 @@ pub fn save_state(cfg: &AppConfig, doc: &StateDocument) -> Result<()> {
     write_state_blocking(Path::new(path), doc)
 }
 
+/// Write `doc` to `path` atomically and durably: a temp file in the same
+/// directory is written and fsynced, then renamed over the target, and the
+/// directory is fsynced so the rename itself survives a crash or power loss.
+/// An interrupted write therefore leaves the previous file intact rather than
+/// an empty or truncated one.
+///
+/// This is synchronous and must only be called from a blocking context.
 pub fn write_state_blocking(path: &Path, doc: &StateDocument) -> Result<()> {
+    use std::io::Write;
+
     let raw = serde_json::to_string_pretty(doc).context("failed to serialize state document")?;
     let tmp = path.with_extension("tmp");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    fs::write(&tmp, raw.as_bytes())
+    let mut file = fs::File::create(&tmp)
         .with_context(|| format!("failed to write state file '{}'", tmp.display()))?;
+    file.write_all(raw.as_bytes())
+        .with_context(|| format!("failed to write state file '{}'", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync state file '{}'", tmp.display()))?;
+    drop(file);
     fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename state file '{}'", path.display()))?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+/// Fsync the directory containing `path` so a preceding rename is durable.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("failed to fsync directory '{}'", dir.display()))
+}
+
+/// Directories cannot be opened for fsync on this platform; the rename is
+/// already durable once it returns.
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
