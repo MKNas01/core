@@ -2838,6 +2838,15 @@ pub struct IncludeMatch {
     pub files: Vec<PathBuf>,
 }
 
+/// Issue #407: rewrite a relative file path so it is relative to `base_dir`
+/// (the directory of the config file that declared it) instead of the
+/// process's working directory. Absolute paths are left unchanged.
+fn resolve_relative_path(base_dir: &Path, path: &mut String) {
+    if Path::new(path.as_str()).is_relative() {
+        *path = base_dir.join(path.as_str()).display().to_string();
+    }
+}
+
 /// `pattern` joined to `base_dir` (or as-is when absolute).
 fn include_path(base_dir: &Path, pattern: &str) -> PathBuf {
     if Path::new(pattern).is_absolute() {
@@ -2915,6 +2924,13 @@ impl AppConfig {
         }
         for (i, contract) in self.contracts.iter_mut().enumerate() {
             let field = |name: &str| format!("contracts[{}].{}", i, name);
+            // Issue #407: file paths resolve relative to the directory of the
+            // file that declared this contract, like `include` patterns.
+            let base_dir = self
+                .contract_files
+                .get(&contract.label.trim().to_lowercase())
+                .and_then(|file| file.parent())
+                .unwrap_or_else(|| Path::new(""));
             if let Some(url) = &mut contract.webhook_url {
                 resolve_field(url, &field("webhook_url"))?;
             }
@@ -2944,6 +2960,7 @@ impl AppConfig {
                 ] {
                     if let Some(value) = value {
                         resolve_field(value, &field(name))?;
+                        resolve_relative_path(base_dir, value);
                     }
                 }
                 if let Some(path) = &destination.template_file {
@@ -3376,9 +3393,12 @@ fn hash_config_recursive(
             .into_iter()
             .flatten()
             {
-                let Ok(file) = resolve_env_interpolation(file) else {
+                let Ok(mut file) = resolve_env_interpolation(file) else {
                     continue;
                 };
+                // Issue #407: relative to this config file, as at load time.
+                let base_dir = path.parent().unwrap_or_else(|| Path::new(""));
+                resolve_relative_path(base_dir, &mut file);
                 hasher.update(file.as_bytes());
                 if let Ok(bytes) = fs::read(&file) {
                     hasher.update(&bytes);
@@ -6048,6 +6068,74 @@ mod tests {
             compute_config_hash(&root).unwrap(),
             "editing template_file must change the config hash"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #407: relative `template_file` paths resolve against the file
+    /// that declared them, not the process's working directory, both in the
+    /// root config and in an included file in another directory.
+    #[test]
+    fn relative_template_file_resolves_against_declaring_file() {
+        let dir = fresh_dir("relative_template_file");
+        // The config lives outside the working directory the test runs in.
+        assert_ne!(std::env::current_dir().unwrap(), dir);
+        let conf_d = dir.join("conf.d");
+        fs::create_dir_all(&conf_d).unwrap();
+        fs::write(dir.join("root.j2"), "root {{ label }}").unwrap();
+        fs::write(conf_d.join("included.j2"), "included {{ label }}").unwrap();
+        let contract = |label: &str, id: &str, template: &str| {
+            format!(
+                r#"
+                [[contracts]]
+                label = "{label}"
+                contract_id = "{id}"
+                network = "testnet"
+                [[contracts.webhooks]]
+                url = "https://example.com/hook"
+                format = "template"
+                template_file = "{template}"
+                [[contracts.rules]]
+                type = "AnyTransaction"
+                "#
+            )
+        };
+        fs::write(
+            conf_d.join("b.toml"),
+            contract(
+                "b",
+                "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526",
+                "included.j2",
+            ),
+        )
+        .unwrap();
+        let root = dir.join("txwatch.toml");
+        fs::write(
+            &root,
+            format!(
+                "include = [\"conf.d/*.toml\"]\n{}",
+                contract(
+                    "a",
+                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+                    "root.j2",
+                )
+            ),
+        )
+        .unwrap();
+
+        let cfg = AppConfig::from_file(&root).unwrap();
+        let template = |label: &str| {
+            cfg.contracts
+                .iter()
+                .find(|c| c.label == label)
+                .and_then(|c| c.webhooks[0].template.clone())
+        };
+        assert_eq!(template("a").as_deref(), Some("root {{ label }}"));
+        assert_eq!(template("b").as_deref(), Some("included {{ label }}"));
+
+        // The config hash follows the same resolution rule.
+        let before = compute_config_hash(&root).unwrap();
+        fs::write(dir.join("root.j2"), "root changed").unwrap();
+        assert_ne!(before, compute_config_hash(&root).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

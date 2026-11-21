@@ -76,10 +76,13 @@ pub fn load_state(cfg: &AppConfig) -> StateDocument {
     let Ok(content) = fs::read_to_string(path) else {
         return StateDocument::default();
     };
-    let doc = if let Ok(doc) = serde_json::from_str::<StateDocument>(&content) {
-        doc
-    } else if let Ok(cursors) = serde_json::from_str::<HashMap<String, String>>(&content) {
+    // Issue #375: try the legacy cursor-only map first. Every field of
+    // `StateDocument` is `#[serde(default)]`, so a legacy map would otherwise
+    // parse as an empty document and its cursors would be lost.
+    let doc = if let Ok(cursors) = serde_json::from_str::<HashMap<String, String>>(&content) {
         StateDocument::from_cursors(cursors)
+    } else if let Ok(doc) = serde_json::from_str::<StateDocument>(&content) {
+        doc
     } else {
         StateDocument::default()
     };
@@ -91,7 +94,8 @@ pub fn prune_state(cfg: &AppConfig, mut doc: StateDocument) -> StateDocument {
     let mut valid_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut valid_rule_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
     for contract in &cfg.contracts {
-        valid_contracts.insert(contract.name.clone());
+        // Issue #375: state is keyed by cursor key, as the writer stores it.
+        valid_contracts.insert(contract.cursor_key());
         for rule in &contract.rules {
             valid_rule_hashes.insert(txwatch_rules::rule_identity(rule));
         }

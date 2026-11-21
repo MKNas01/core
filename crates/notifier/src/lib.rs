@@ -571,13 +571,6 @@ pub fn test_payload_with_network(
         transaction_hash: tx_hash.into(),
         function_name: Some("test".into()),
         function_names: vec!["test".into()],
-        amount_xlm: None,
-        amount_stroops: None,
-        amount_xlm_decimal: None,
-        fee_charged_stroops: None,
-        source_account: None,
-        fee_account: None,
-        severity: None,
         timestamp: now.timestamp(),
         timestamp_iso: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link: format!("{}/transactions/{}", horizon_base_url, tx_hash),
@@ -585,19 +578,11 @@ pub fn test_payload_with_network(
             Some(explorer) => format!("{}/tx/{}", explorer, tx_hash),
             None => format!("{}/transactions/{}", horizon_base_url, tx_hash),
         },
-        effective_webhook_url: None,
-        effective_webhook_secret: None,
-        ledger: None,
-        memo: None,
-        memo_type: None,
-        operation_count: None,
-        resolved: false,
-        matched_events: vec![],
-        suppressed_count: 0,
         test: true,
-        old_wasm_hash: None,
-        new_wasm_hash: None,
-        enrichment_incomplete: false,
+        // Issue #374: every other field — including `function_args` (#266)
+        // and `observed_count` (#267) — takes its default, so new fields no
+        // longer break this literal.
+        ..AlertPayload::default()
     }
 }
 

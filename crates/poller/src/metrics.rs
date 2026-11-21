@@ -46,10 +46,7 @@ use prometheus::{
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
-    },
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -435,10 +432,6 @@ pub fn record_poll_failure(contract: &str, network: &str) {
 
 // ── Readiness ─────────────────────────────────────────────────────────────────
 
-/// Unix seconds of the last successful contract poll (0 = never).
-static LAST_POLL_SUCCESS: AtomicU64 = AtomicU64::new(0);
-/// Configured poll interval in seconds, used to judge readiness.
-static POLL_INTERVAL_SECS: AtomicU64 = AtomicU64::new(0);
 /// Readiness of one polled contract.
 #[derive(Debug, Clone, Copy)]
 struct ContractReadiness {
