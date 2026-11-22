@@ -25,6 +25,20 @@ jobs:
       - name: Check workspace compiles
         run: cargo check --workspace --all-targets --all-features
 
+  # Issue #376: the default Docker image builds with `--features metrics`, so
+  # check that exact feature set on its own, fast job.
+  check-metrics:
+    name: Cargo check (metrics feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check metrics feature compiles
+        run: cargo check -p txwatch --features metrics
+
   # NOTE: this job must be configured as a required status check for merges
   # (branch protection on `main`), otherwise stale schemas can land.
   config-schema:

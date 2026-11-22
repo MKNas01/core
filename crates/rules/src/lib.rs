@@ -690,6 +690,52 @@ pub struct AlertPayload {
     pub enrichment_incomplete: bool,
 }
 
+/// Issue #374: a baseline payload (current schema version, every other field
+/// empty) so tests and synthetic payloads can use `..Default::default()` and
+/// keep compiling when new fields are added.
+impl Default for AlertPayload {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            alert_id: String::new(),
+            label: String::new(),
+            contract_id: String::new(),
+            network: String::new(),
+            rule_type: String::new(),
+            rule_triggered: String::new(),
+            transaction_hash: String::new(),
+            function_name: None,
+            function_names: Vec::new(),
+            function_args: Vec::new(),
+            amount_xlm: None,
+            amount_stroops: None,
+            amount_xlm_decimal: None,
+            fee_charged_stroops: None,
+            source_account: None,
+            fee_account: None,
+            severity: None,
+            timestamp: 0,
+            timestamp_iso: String::new(),
+            horizon_link: String::new(),
+            explorer_link: String::new(),
+            effective_webhook_url: None,
+            effective_webhook_secret: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            resolved: false,
+            matched_events: Vec::new(),
+            suppressed_count: 0,
+            observed_count: None,
+            test: false,
+            old_wasm_hash: None,
+            new_wasm_hash: None,
+            enrichment_incomplete: false,
+        }
+    }
+}
+
 /// Deterministic alert ID: the first 32 hex characters (128 bits) of
 /// SHA-256 over the network cursor ID, `contract_id`, `transaction_hash`,
 /// `rule_type`, `rule_triggered` and the rule's index within its contract's

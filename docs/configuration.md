@@ -249,6 +249,11 @@ its own HTTP client, built once at startup (and again on `SIGHUP` reload) and re
 delivery, so a burst of alerts does not pay a TLS handshake per alert. The paths support
 `${ENV_VAR}` interpolation.
 
+Relative `template_file`, `client_cert`, `client_key` and `ca_cert` paths resolve relative to the
+directory of the config file that declares them (after `${ENV_VAR}` interpolation), exactly like
+`include` patterns, not to the process's working directory. A contract defined in an included file
+therefore resolves its paths against that included file's directory. Absolute paths are used as is.
+
 The certificate files are read and parsed during config validation, so a typo'd path, an unreadable
 key or a malformed PEM is reported by `txwatch validate` (and at startup) instead of at the first
 delivery. Errors name the field (e.g. `webhooks[0].client_key`) and never print file contents.

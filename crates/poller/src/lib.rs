@@ -12,6 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
+#[cfg(test)]
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -363,7 +364,8 @@ pub async fn run_with_reload(
     let _state_lock = acquire_state_lock(cfg.cursor_file.as_deref())?;
     // Issue #281: load the versioned state document (cursors, cooldowns and
     // NoActivity states), migrating a legacy cursor-only file if needed.
-    let loaded = load_state(&cfg);
+    // Issue #375: this is the single source of truth for start-up state.
+    let loaded = load_start_state(&cfg);
     // Shared so each contract's task can persist the whole cursor map after a
     // cycle that advanced its own cursor.
     let cursors = Arc::new(Mutex::new(loaded.cursors.clone()));
@@ -373,8 +375,6 @@ pub async fn run_with_reload(
     let state_handle = state_writer.handle();
     let cooldown_state = Arc::new(Mutex::new(loaded.cooldowns.clone()));
     let no_activity_state = Arc::new(Mutex::new(loaded.no_activity.clone()));
-    let cursor_file = cfg.cursor_file.clone().map(PathBuf::from);
-    let cursors = Arc::new(Mutex::new(load_cursors(&cfg)));
     // Issue #275: per-contract runtime state (cooldowns, poll state, health)
     // lives here, keyed by `cursor_key`, so it survives config reloads instead
     // of being recreated with every generation of polling tasks.
@@ -555,15 +555,21 @@ pub async fn run_with_reload(
         }
         // Issue #5: flush once more on the way out, so a graceful shutdown
         // persists cursors advanced since the last per-cycle write.
-        if let Err(e) = save_cursors(&cfg, &lock(&cursors)) {
-            error!(error = %e, "failed to flush cursors on shutdown");
+        // Issue #375: write the whole state document, not a cursor-only map,
+        // so cooldowns and NoActivity state survive the restart as well.
+        let final_state = StateDocument::from_parts(
+            lock(&cursors).clone(),
+            lock(&cooldown_state).clone(),
+            lock(&no_activity_state).clone(),
+        );
+        if let Err(e) = save_state(&cfg, &final_state) {
+            error!(error = %e, "failed to flush state on shutdown");
         }
         // Issue #278: drain the coalescing writer so the final state is durable.
         state_handle.flush().await;
 
         let Some(new_cfg) = new_cfg else { break };
-        let start = load_state(&new_cfg).cursors;
-        let start = load_cursors(&new_cfg);
+        let start = load_start_state(&new_cfg).cursors;
         // Issue #277: keep cursors for contracts that are no longer configured
         // so that temporarily removing and re-adding a contract does not lose
         // every transaction in between.
@@ -892,24 +898,6 @@ async fn poll_contract_forever(
     )
 }
 
-/// Reads the raw cursor map from `path`. An unreadable or unparseable file is
-/// logged and treated as empty, so every contract starts from `now`.
-fn read_saved_cursors(path: &str) -> HashMap<String, String> {
-    match fs::read_to_string(path) {
-        Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
-            Ok(map) => map,
-            Err(e) => {
-                warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts");
-                HashMap::new()
-            }
-        },
-        Err(e) => {
-            debug!(error = ?e, "could not read cursor_file; starting from 'now'");
-            HashMap::new()
-        }
-    }
-}
-
 /// Resolves the saved cursor map against the configured contracts.
 ///
 /// `configured` holds one `(cursor_key, contract_id)` pair per configured
@@ -956,16 +944,14 @@ fn migrate_saved_cursors(
     cursors
 }
 
-/// Load the cursor map, keyed `<network>:<contract_id>` (see
-/// [`WatchedContract::cursor_key`]), from `cfg.cursor_file`, migrating legacy
-/// contract-ID keys and defaulting every configured contract without a saved
-/// cursor to Horizon's `now`.
-fn load_cursors(cfg: &AppConfig) -> HashMap<String, String> {
-    let saved = cfg
-        .cursor_file
-        .as_deref()
-        .map(read_saved_cursors)
-        .unwrap_or_default();
+/// Issue #375: load the persisted state document with [`load_state`] — the
+/// single source of truth for cursors, cooldowns and NoActivity states — and
+/// resolve its cursors against `cfg`: legacy contract-ID keys are migrated
+/// (see [`migrate_saved_cursors`]) and every configured contract without a
+/// saved cursor starts from Horizon's `now`.
+fn load_start_state(cfg: &AppConfig) -> StateDocument {
+    let mut doc = load_state(cfg);
+    let saved = std::mem::take(&mut doc.cursors);
     let configured: Vec<(String, String)> = cfg
         .contracts
         .iter()
@@ -976,16 +962,8 @@ fn load_cursors(cfg: &AppConfig) -> HashMap<String, String> {
     for (key, _) in configured {
         cursors.entry(key).or_insert_with(|| "now".to_string());
     }
-    cursors
-}
-
-/// Write the cursor map to `cfg.cursor_file`, if one is configured. Writes to a
-/// temporary file first so an interrupted write never corrupts the saved map.
-fn save_cursors(cfg: &AppConfig, cursors: &HashMap<String, String>) -> Result<()> {
-    let Some(path) = &cfg.cursor_file else {
-        return Ok(());
-    };
-    write_cursor_file(Path::new(path), cursors)
+    doc.cursors = cursors;
+    doc
 }
 
 /// Shared cursor state a per-contract task needs to persist the whole cursor
@@ -3588,6 +3566,11 @@ mod tests {
         std::env::temp_dir().join(format!("txwatch-{}-{}", std::process::id(), name))
     }
 
+    /// The cursors `run_with_reload` starts from (issue #375).
+    fn load_cursors(cfg: &AppConfig) -> HashMap<String, String> {
+        load_start_state(cfg).cursors
+    }
+
     fn all_now() -> HashMap<String, String> {
         HashMap::from([
             (format!("testnet:{ID_A}"), "now".into()),
@@ -3663,6 +3646,48 @@ mod tests {
             load_cursors(&cursor_config(Some(missing.display().to_string()))),
             all_now()
         );
+    }
+
+    /// Issue #375: what one run saves on shutdown, the next run's start-up
+    /// path restores — cursors, cooldowns and NoActivity state together.
+    #[test]
+    fn restart_restores_cursors_cooldowns_and_no_activity_together() {
+        let path = temp_path("restart-state.json");
+        let cfg = cursor_config(Some(path.display().to_string()));
+        let key_a = format!("testnet:{ID_A}");
+        let key_b = format!("testnet:{ID_B}");
+        let rule_id = txwatch_rules::rule_identity(&cfg.contracts[0].rules[0]);
+
+        let cursors = HashMap::from([(key_a.clone(), "111".to_string())]);
+        let cooldown: CooldownTracker = serde_json::from_value(serde_json::json!([[
+            ["CAAA", "any_transaction"],
+            {"last_fired": "2026-01-01T00:00:00Z", "suppressed": 3}
+        ]]))
+        .unwrap();
+        let cooldowns = HashMap::from([(key_a.clone(), cooldown)]);
+        let alerting = NoActivityState::Alerting {
+            incident_alert_id: "incident-1".into(),
+        };
+        let no_activity = HashMap::from([(
+            key_a.clone(),
+            HashMap::from([(rule_id.clone(), alerting.clone())]),
+        )]);
+        save_state(
+            &cfg,
+            &StateDocument::from_parts(cursors, cooldowns.clone(), no_activity),
+        )
+        .unwrap();
+
+        let restored = load_start_state(&cfg);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(restored.cursors.get(&key_a).map(String::as_str), Some("111"));
+        assert_eq!(restored.cursors.get(&key_b).map(String::as_str), Some("now"));
+        assert_eq!(
+            serde_json::to_value(&restored.cooldowns[&key_a]).unwrap(),
+            serde_json::to_value(&cooldowns[&key_a]).unwrap()
+        );
+        assert_eq!(restored.no_activity[&key_a].get(&rule_id), Some(&alerting));
     }
 
     #[tokio::test]
